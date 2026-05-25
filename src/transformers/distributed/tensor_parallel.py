@@ -28,8 +28,9 @@ if is_torch_available() and is_torch_greater_or_equal("2.5"):
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
     from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
         PrepareModuleInput,
-        RowwiseParallel as TorchRowwiseParallel,
+        RowwiseParallel,
         SequenceParallel,
     )
     from torch.distributed.tensor.parallel.style import ParallelStyle
@@ -300,106 +301,6 @@ class PackedColwiseParallel(TensorParallelStyle):
         )
 
 
-class ColwiseParallel(TensorParallelStyle):
-    """Column-wise sharded linear with a mode-aware forward: at load time the weight is sharded on dim -2 and the bias
-    on dim -1, and at runtime the path depends on `module.training`. In training, inputs are wrapped as a Replicate
-    DTensor and the matmul flows through DTensor's autograd path. In inference, params are swapped to plain local
-    Parameters via `context_around_forward` and the matmul runs as a plain nn.Linear on local shards, producing a
-    Shard(-1) output that feeds directly into the matching `rowwise_allreduce`."""
-
-    def __init__(self, *, input_layouts=None, output_layouts=None, use_local_output=True):
-        super().__init__()
-        self.input_layouts = input_layouts or Replicate()
-        self.output_layouts = output_layouts or Shard(-1)
-        self.use_local_output = use_local_output
-
-    def _apply(self, module, mesh):
-        for name, dim in (("weight", -2), ("bias", -1)):
-            meta = module._parameters.get(name)
-            if meta is None:
-                continue
-            module._parameters[name] = torch.nn.Parameter(
-                distribute_tensor(meta, mesh, [Shard(dim)], src_data_rank=None),
-                requires_grad=meta.requires_grad,
-            )
-        module._tp_group = mesh.get_group() if mesh.ndim == 1 else mesh.get_group("tp")
-        return super()._apply(module, mesh)
-
-    def transform_inputs_pre_forward(self, module, args, kwargs, mesh):
-        x = args[0]
-        # In a training context, inputs are wrapped in a DTensor
-        if module.training and not isinstance(x, DTensor):
-            x = DTensor.from_local(x, mesh, [self.input_layouts], run_check=False)
-        # In an inference context, inputs are kept as plain tensors so the matmul does not use DTensor's dispatcher
-        elif not module.training and isinstance(x, DTensor):
-            x = x.to_local()
-        return (x,) + args[1:], kwargs
-
-    def context_around_forward(self, module):
-        """In inference, swaps DTensor params to plain local Parameters so nn.Linear runs as a plain matmul"""
-        return contextlib.nullcontext() if module.training else _swap_dtensor_params_for_local(module)
-
-    def transform_output_post_forward(self, module, output, mesh):
-        # Inference path: forward ran on local tensors; output is already local for Shard(-1).
-        if not module.training and self.output_layouts == Shard(-1):
-            return output.to_local() if isinstance(output, DTensor) else output
-        # Training path
-        if isinstance(output, DTensor) and output.placements != (self.output_layouts,):
-            output = output.redistribute(placements=[self.output_layouts])
-        if self.use_local_output and isinstance(output, DTensor):
-            return output.to_local()
-        return output
-
-
-class RowwiseParallel(TensorParallelStyle):
-    """Row-wise sharded linear with a mode-aware forward: the weight is sharded on dim -1, the bias stays replicated,
-    and the all-reduce on output is selected by `module.training`. In training, the Partial DTensor output is
-    redistributed to Replicate through DTensor's autograd-aware path. In inference, params are swapped to plain local
-    Parameters via `context_around_forward` and the local Partial sum is reduced with a raw in-place `dist.all_reduce`,
-    skipping DTensor's Python machinery."""
-
-    def __init__(self, *, input_layouts=None, output_layouts=None):
-        super().__init__()
-        self.input_layouts = input_layouts or Shard(-1)
-        self.output_layouts = output_layouts or Replicate()
-
-    def _apply(self, module, mesh):
-        meta = module._parameters.get("weight")
-        if meta is not None:
-            module._parameters["weight"] = torch.nn.Parameter(
-                distribute_tensor(meta, mesh, [Shard(-1)], src_data_rank=None),
-                requires_grad=meta.requires_grad,
-            )
-        # bias stays replicated (no sharding for rowwise)
-        module._tp_group = mesh.get_group() if mesh.ndim == 1 else mesh.get_group("tp")
-        return super()._apply(module, mesh)
-
-    def transform_inputs_pre_forward(self, module, args, kwargs, mesh):
-        x = args[0]
-        # In a training context, inputs are wrapped in a DTensor
-        if module.training and not isinstance(x, DTensor):
-            x = DTensor.from_local(x, mesh, [self.input_layouts], run_check=False)
-        # In an inference context, inputs are kept as plain tensors so the matmul does not use DTensor's dispatcher
-        elif not module.training and isinstance(x, DTensor):
-            x = x.to_local()
-        return (x,) + args[1:], kwargs
-
-    def context_around_forward(self, module):
-        """In inference, swaps DTensor params to plain local Parameters so nn.Linear runs as a plain matmul"""
-        return contextlib.nullcontext() if module.training else _swap_dtensor_params_for_local(module)
-
-    def transform_output_post_forward(self, module, output, mesh):
-        # Inference path: output is local (Partial sum), do plain in-place all-reduce.
-        if not module.training and self.output_layouts == Replicate():
-            local = output.to_local() if isinstance(output, DTensor) else output
-            dist.all_reduce(local, op=dist.ReduceOp.SUM, group=module._tp_group)
-            return local
-        # Training path
-        if isinstance(output, DTensor):
-            return output.redistribute(placements=[self.output_layouts]).to_local()
-        return output
-
-
 if is_torch_available() and is_torch_greater_or_equal("2.5"):
 
     class _AllReduceBackward(torch.autograd.Function):
@@ -521,8 +422,9 @@ class ParallelInterface(GeneralInterface):
             # Row-parallel
             "rowwise_allreduce": RowwiseParallel(input_layouts=Shard(-1), output_layouts=Replicate()),
             "rowwise_reduce_scatter": RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1)),
-            "vocab_allreduce": TorchRowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate()),
-            "vocab_reduce_scatter": TorchRowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+            # Vocab / embedding (rowwise sharding on vocab dim)
+            "vocab_allreduce": RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate()),
+            "vocab_reduce_scatter": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
             # Activation / norm (sequence-parallel passthrough)
             # use_local_output=True: torch defaults to False here, but downstream modeling
             # code expects plain tensors, not DTensors.
